@@ -1,0 +1,516 @@
+import sys
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, 
+    QPushButton, QLabel, QGroupBox, QSpinBox, QComboBox, QStackedWidget, QRadioButton, QMessageBox, QProgressBar
+)
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
+from ssh_communication import SSHCommunicator
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from PyQt5.QtCore import QTimer
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+import numpy as np
+import matplotlib.pyplot as plt
+class MplCanvas(FigureCanvas):
+    def __init__(self, parent=None, width=5, height=4, dpi=100):
+        fig = Figure(figsize=(width, height), dpi=dpi)
+        self.axes = fig.add_subplot(111)
+        super().__init__(fig)
+        self.setParent(parent)
+import time
+
+
+from PyQt5.QtCore import QTimer
+
+class SSHWorker(QThread):
+    result = pyqtSignal(str, str)  # Signal to return data and status
+
+    def __init__(self, ssh_communicator, number_samples, sampling_frequency):
+        super().__init__()
+        self.ssh_communicator = ssh_communicator
+        self.number_samples = number_samples
+        self.sampling_frequency = sampling_frequency
+        self.acquisition_time = self.number_samples / self.sampling_frequency
+    
+
+
+    def run(self):
+        output, error = self.ssh_communicator.run_application(self.number_samples, self.sampling_frequency)
+        if error:
+            self.result.emit("", f"Error: {error}")
+        else:
+            self.result.emit(output, "Data received successfully.")
+
+# Ensure ssh_communicator.run_application returns the raw output and any error messages
+
+
+    def finish_acquisition(self, data, message):
+        # Ensure data is a list before emitting
+        if not isinstance(data, list):
+            data = []  # Convert to empty list if it's not a list
+            message = "No valid data received or data processing error."
+    
+        self.result.emit(data, message)
+
+class FFTWorker(QThread):
+    result = pyqtSignal(np.ndarray, np.ndarray)  # Signal to send back the FFT result and frequency
+
+    def __init__(self, data_fft, sampling_frequency):
+        super().__init__()
+        self.data_fft = data_fft
+        self.sampling_frequency = sampling_frequency
+
+
+    def run(self):
+        # Perform FFT calculation
+        decimation_factor = int(125e6 / (2*self.sampling_frequency))
+        fft_result = np.fft.fft(self.data_fft)
+        freq = np.fft.fftfreq(len(self.data_fft), d=1/(125e6/(2*decimation_factor)))
+
+        self.result.emit(freq, fft_result)
+
+class FPGAApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.ssh_communicator = SSHCommunicator()
+        self.setWindowTitle("FPGA Acquisition and Analysis Tool")
+        self.setGeometry(100, 100, 1920, 1080)
+
+        self.initUI()
+        self.worker = None  # Initialize worker
+        self.number_samples = None
+        self.sampling_frequency = None
+        self.dominant_frequency = None
+        self.dominant_amplitude = None
+        self.phase_ch1 = None  # Initialize as None
+        self.phase_ch2 = None  # Initialize as None
+
+    def initUI(self):
+        main_widget = QWidget(self)
+        main_layout = QVBoxLayout(main_widget)
+
+        # Mode Selection GroupBox
+        mode_groupbox = QGroupBox("Acquisition Mode", self)
+        mode_layout = QHBoxLayout(mode_groupbox)
+
+        self.known_freq_rb = QRadioButton("Known Input Frequency")
+        self.unknown_freq_rb = QRadioButton("Unknown Input Frequency (Max/Min Resolution)")
+        self.unknown_freq_rb.setChecked(True)
+
+        mode_layout.addWidget(self.known_freq_rb)
+        mode_layout.addWidget(self.unknown_freq_rb)
+        main_layout.addWidget(mode_groupbox)
+
+        # Stacked Widget for different configurations
+        self.stacked_widget = QStackedWidget(self)
+
+        # Page for Unknown Input Frequency
+        unknown_page = QWidget()
+        unknown_layout = QVBoxLayout(unknown_page)
+
+        unknown_groupbox = QGroupBox("Unknown Input Frequency Configuration", self)
+        unknown_rb_layout = QVBoxLayout(unknown_groupbox)
+
+        self.max_res_rb = QRadioButton("Max Resolution (Min Sampling Frequency)")
+        self.min_res_rb = QRadioButton("Min Resolution (Max Sampling Frequency)")
+        self.max_res_rb.setChecked(True)
+
+        unknown_rb_layout.addWidget(self.max_res_rb)
+        unknown_rb_layout.addWidget(self.min_res_rb)
+        unknown_layout.addWidget(unknown_groupbox)
+
+        # Page for Known Input Frequency
+        known_page = QWidget()
+        known_layout = QVBoxLayout(known_page)
+
+        known_groupbox = QGroupBox("Known Input Frequency Configuration", self)
+        known_cfg_layout = QVBoxLayout(known_groupbox)
+
+        freq_input_layout = QHBoxLayout()
+        known_label = QLabel("Frequency:")
+        self.frequency_input = QLineEdit()
+        self.frequency_input.setPlaceholderText("Enter frequency")
+        self.frequency_input.setMaximumWidth(100)
+        self.freq_unit_combo = QComboBox()
+        self.freq_unit_combo.addItems(["Hz", "kHz", "MHz"])
+        freq_input_layout.addWidget(known_label)
+        freq_input_layout.addWidget(self.frequency_input)
+        freq_input_layout.addWidget(self.freq_unit_combo)
+
+        periods_layout = QHBoxLayout()
+        periods_label = QLabel("Number of Periods:")
+        self.periods_spinbox = QSpinBox()
+        self.periods_spinbox.setMinimum(1)
+        self.periods_spinbox.setMaximum(100000)
+        self.periods_spinbox.setMinimumWidth(60)
+        periods_layout.addWidget(periods_label)
+        periods_layout.addWidget(self.periods_spinbox)
+        periods_layout.addStretch(1)
+
+        sampling_layout = QHBoxLayout()
+        sampling_label = QLabel("Desired Sampling Frequency:")
+        self.sampling_input = QLineEdit()
+        self.sampling_input.setPlaceholderText("Enter sampling frequency")
+        self.sampling_input.setMaximumWidth(100)
+        self.sampling_unit_combo = QComboBox()
+        self.sampling_unit_combo.addItems(["Hz", "kHz", "MHz"])
+        sampling_layout.addWidget(sampling_label)
+        sampling_layout.addWidget(self.sampling_input)
+        sampling_layout.addWidget(self.sampling_unit_combo)
+
+        known_cfg_layout.addLayout(freq_input_layout)
+        known_cfg_layout.addLayout(periods_layout)
+        known_cfg_layout.addLayout(sampling_layout)
+        known_layout.addWidget(known_groupbox)
+
+        self.stacked_widget.addWidget(unknown_page)
+        self.stacked_widget.addWidget(known_page)
+        main_layout.addWidget(self.stacked_widget)
+
+        # Graphs for data and FFT
+        graph_display_layout = QHBoxLayout()
+
+        # Data canvas and toolbar
+        self.data_canvas = MplCanvas(self, width=5, height=4, dpi=100)
+        data_toolbar = NavigationToolbar(self.data_canvas, self)
+        data_layout = QVBoxLayout()
+        data_layout.addWidget(data_toolbar)
+        data_layout.addWidget(self.data_canvas)
+        graph_display_layout.addLayout(data_layout)
+
+        # FFT canvas and toolbar
+        self.fft_canvas = MplCanvas(self, width=5, height=4, dpi=100)
+        fft_toolbar = NavigationToolbar(self.fft_canvas, self)
+        fft_layout = QVBoxLayout()
+        fft_layout.addWidget(fft_toolbar)
+        fft_layout.addWidget(self.fft_canvas)
+        graph_display_layout.addLayout(fft_layout)
+
+        main_layout.addLayout(graph_display_layout)
+
+        # Variables Display
+        variables_layout = QHBoxLayout()
+        channel1_layout = QVBoxLayout()
+        self.amplitude_label_ch1 = QLabel("Channel 1 Amplitude: N/A")
+        self.frequency_label_ch1 = QLabel("Channel 1 Frequency: N/A")
+        self.offset_label_ch1 = QLabel("Channel 1 Offset: N/A")
+        channel1_layout.addWidget(self.amplitude_label_ch1)
+        channel1_layout.addWidget(self.frequency_label_ch1)
+        channel1_layout.addWidget(self.offset_label_ch1)
+
+        channel2_layout = QVBoxLayout()
+        self.amplitude_label_ch2 = QLabel("Channel 2 Amplitude: N/A")
+        self.frequency_label_ch2 = QLabel("Channel 2 Frequency: N/A")
+        self.offset_label_ch2 = QLabel("Channel 2 Offset: N/A")
+        channel2_layout.addWidget(self.amplitude_label_ch2)
+        channel2_layout.addWidget(self.frequency_label_ch2)
+        channel2_layout.addWidget(self.offset_label_ch2)
+
+        phase_diff_layout = QVBoxLayout()
+        self.phase_diff_label_shared = QLabel("CH1-CH2 Phase Difference: N/A")
+        phase_diff_layout.addStretch(1)
+        phase_diff_layout.addWidget(self.phase_diff_label_shared)
+        phase_diff_layout.addStretch(1)
+
+        variables_layout.addLayout(channel1_layout)
+        variables_layout.addLayout(phase_diff_layout)
+        variables_layout.addLayout(channel2_layout)
+        main_layout.addLayout(variables_layout)
+
+        # Buttons
+        save_button = QPushButton('Save and Deploy Configuration')
+        save_button.clicked.connect(self.deploy_configuration)
+        main_layout.addWidget(save_button)
+
+        run_button = QPushButton('Run Application and Compute FFT')
+        run_button.clicked.connect(self.run_application)
+        main_layout.addWidget(run_button)
+
+        # Progress bar
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setAlignment(Qt.AlignCenter)
+        self.progress_bar.setStyleSheet("QProgressBar::chunk {background-color: green;}")
+        main_layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel('')
+        main_layout.addWidget(self.status_label)
+
+        self.setCentralWidget(main_widget)
+
+        # Connect radio buttons to change configurations
+        self.known_freq_rb.toggled.connect(self.update_mode)
+        self.unknown_freq_rb.toggled.connect(self.update_mode)
+
+        # Set the initial mode to Unknown Input Frequency
+        self.update_mode()
+
+    def update_mode(self):
+        if self.known_freq_rb.isChecked():
+            self.stacked_widget.setCurrentIndex(1)
+        else:
+            self.stacked_widget.setCurrentIndex(0)
+
+    def deploy_configuration(self):
+        # Initialize instance variables
+        self.frequency = None
+        self.periods = None
+        self.sampling_frequency = None
+        self.number_samples = None
+    
+        if self.known_freq_rb.isChecked():
+            try:
+                # Retrieve user input
+                self.frequency = float(self.frequency_input.text())
+                unit_multiplier = {'Hz': 1, 'kHz': 1e3, 'MHz': 1e6}[self.freq_unit_combo.currentText()]
+                self.frequency *= unit_multiplier
+    
+                self.periods = self.periods_spinbox.value()
+    
+                self.sampling_frequency = float(self.sampling_input.text())
+                self.sampling_frequency *= {'Hz': 1, 'kHz': 1e3, 'MHz': 1e6}[self.sampling_unit_combo.currentText()]
+                print("sampless==",self.frequency)
+                # Calculate number of samples
+                self.number_samples = int((self.sampling_frequency * self.periods)/self.frequency)
+
+                # Check if the sampling frequency satisfies Nyquist theorem (sampling_frequency >= 2 * frequency)
+                if self.sampling_frequency < 2 * self.frequency:
+                    self.show_error_popup(
+                        "Nyquist Frequency Error",
+                        "The sampling frequency must be at least twice the signal frequency to satisfy the Nyquist criterion. Please enter a higher sampling frequency or lower the input frequency."
+                    )
+                    return  # Don't close the app, let user correct input
+    
+                # Check if number of samples exceeds the limit
+                if self.number_samples > 1048575:
+                    self.show_error_popup(
+                        "Sample Limit Exceeded",
+                        "The number of samples exceeds the maximum limit of 1048575. Please reduce the number of samples."
+                    )
+                    return  # Don't close the app, let user correct input
+                if self.sampling_frequency > 62500000 or self.sampling_frequency<10000:
+                    self.show_error_popup(
+                        "Sample Limit Exceeded",
+                        "The sampling frequency selected is out of the available range {10 kHz to 62.5 MHz}"
+                    )
+                    return  # Don't close the app, let user correct input
+            except ValueError:
+                self.show_error_popup('Input Error', "Invalid frequency, sampling frequency, or period input. Please correct the input.")
+                return  # Let the user correct the input
+        else:
+            # For unknown input frequency mode
+            self.sampling_frequency = 125000000 / (6250 * 2) if self.max_res_rb.isChecked() else 125000000 / (5 * 2)
+            self.number_samples = (1024 * 1024) - 1  # Default number of samples for unknown frequency mode
+    
+            # Check if number of samples exceeds the limit
+            if self.number_samples > 1048575:
+                self.show_error_popup(
+                    "Sample Limit Exceeded",
+                    "The number of samples exceeds the maximum limit of 1048575. Please reduce the number of samples or change the input frequency."
+                )
+                return  # Don't close the app, let user correct input
+    
+        # Deploy configuration via SSH
+        message = self.ssh_communicator.deploy_configuration(self.number_samples, self.sampling_frequency)
+        self.status_label.setText(message)
+    
+    # Popup message method
+    def show_error_popup(self, title, message):
+        QMessageBox.warning(self, title, message)
+
+
+
+    def handle_fft_result(self, freq, fft_result,channel):
+
+        # Convert FFT result to voltage by dividing by the ADC scale factor (8191)
+        amplitude_spectrum = 1.036948176583493*np.abs(fft_result) / len(fft_result)  # ADC calibration. Normalize by the number of samples
+        amplitude_spectrum_voltage = amplitude_spectrum / 8191  # Convert to voltage
+        amplitude_spectrum_voltage[1:] *= 2
+        # Compute the DC offset (mean value of the signal) from the FFT
+        dc_offset = 1.036948176583493*amplitude_spectrum_voltage[0]  # DC component (0 Hz)
+        phase_spectrum = np.angle(fft_result)
+        # Find the dominant frequency and its amplitude
+        max_idx = np.argmax(amplitude_spectrum_voltage[1:]) + 1  # Ignoring the DC component
+
+        
+        
+        if(max_idx>(self.number_samples/2)): #Symmetric detection correction
+            max_idx=(self.number_samples-max_idx)
+            print("corrected_madix",max_idx)
+        self.dominant_frequency = freq[max_idx]
+        self.dominant_amplitude = amplitude_spectrum_voltage[max_idx]
+        self.dominant_phase = phase_spectrum[max_idx]
+        plt.figure
+        
+        # Update the labels for Channel 1
+        if channel == 1:
+            self.amplitude_label_ch1.setText(f"Channel 1 Amplitude: {self.dominant_amplitude:.4f} V")
+            self.frequency_label_ch1.setText(f"Channel 1 Frequency: {self.dominant_frequency:.2f} Hz")
+            self.offset_label_ch1.setText(f"Channel 1 Offset: {dc_offset:.4f} V")
+            self.phase_ch1 = self.dominant_phase
+            self.vin_amplitude = self.dominant_amplitude
+            
+        elif channel == 2:
+            self.amplitude_label_ch2.setText(f"Channel 2 Amplitude: {self.dominant_amplitude:.4f} V")
+            self.frequency_label_ch2.setText(f"Channel 2 Frequency: {self.dominant_frequency:.2f} Hz")
+            self.offset_label_ch2.setText(f"Channel 2 Offset: {dc_offset:.4f} V")
+            self.phase_ch2 = self.dominant_phase
+            self.i_amplitude = self.dominant_amplitude  # Store I amplitude (Current from Channel 2)
+
+
+            
+        if self.phase_ch1 is not None and self.phase_ch2 is not None:
+            # Compute phase difference and normalize to [-pi, pi]
+
+            phase_difference = self.phase_ch1 - self.phase_ch2
+            phase_difference = np.arctan2(np.sin(phase_difference), np.cos(phase_difference))*(180/np.pi)
+            if(phase_difference>360):
+                phase_difference=phase_difference-360
+            elif phase_difference < 0:
+                phase_difference = phase_difference + 360
+            self.phase_diff_label_shared.setText(f"Phase Difference: {phase_difference:.4f} rad")           
+
+        vin = self.vin_amplitude
+        current = self.i_amplitude
+        frequency = self.dominant_frequency
+        impedance = vin / current
+        phase_difference_radians = np.radians(phase_difference)  # Convert phase to radians
+        inductive_reactance = impedance * np.sin(phase_difference_radians)  # X_L = Z * sin(phase_diff)
+        inductance = inductive_reactance / (2 * np.pi * frequency)  # L = X_L / (2 * pi * f)
+        print("la bobina es", inductance)
+    def run_application(self):
+        print("Run Application Button Clicked")  # Debugging print statement
+        self.progress_bar.setValue(0)
+        self.start_acquisition_progress(self.number_samples, self.sampling_frequency)
+    
+        # Run the application via SSH in a separate thread
+        self.worker = SSHWorker(self.ssh_communicator, self.number_samples, self.sampling_frequency)
+
+        self.worker.result.connect(self.on_run_application_complete)
+        self.worker.start()
+
+    def on_run_application_complete(self, data, message):
+        if data is None or len(data) == 0:
+            # Handle the case where no data is returned
+            self.status_label.setText("Error: No data captured.")
+            return
+
+        # Otherwise, process the data and compute FFT
+        self.update_data_graph(data)
+        self.plot_fft(data)
+        # Calculate the value you want to display
+        trustable_frequency_range = (self.sampling_frequency / (self.number_samples))
+        frecuencia = self.dominant_frequency 
+        # Update the status label with the formatted message
+        self.status_label.setText(f'Acquisition and FFT computation completed successfully. Your FFT frequency result has a ± {trustable_frequency_range:.2f} Hz range')
+
+    def parse_output_to_list(self, output):
+        lines = output.splitlines()  # Split the output into individual lines
+        x_data = []
+        parsed_data0 = []
+        parsed_data1 = []
+        
+        for line in lines:
+            if line.strip():  # Skip empty lines
+                parts = line.split()  # Split the line into parts based on whitespace
+                if len(parts) == 2:  # Ensure the line has exactly two parts
+                    try:
+                        x_data.append(len(x_data))  # Use the index as x-axis data
+                        parsed_data0.append(float(parts[0]))  # Convert first part to float and store in data0
+                        parsed_data1.append(float(parts[1]))  # Convert second part to float and store in data1
+                    except ValueError:
+                        print(f"Skipping line due to conversion error: {line}")
+    
+        return x_data, parsed_data0, parsed_data1  # Return parsed lists
+
+    
+
+
+
+
+
+
+    def start_acquisition_progress(self, number_samples, sampling_frequency):
+        # Calculate the total acquisition time in seconds
+        total_time = (number_samples / sampling_frequency)+0.85
+        print(total_time, "este tiempo va estable???")
+    
+        self.progress_bar.setValue(0)
+    
+        self.update_interval = total_time / 100  
+    
+        if hasattr(self, 'timer') and self.timer.isActive():
+            self.timer.stop()
+    
+    
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_progress)
+        self.timer.start(int(self.update_interval * 1000))  # Convert to milliseconds
+    
+    def update_progress(self):
+        if self.progress_bar.value() >= 1000:  # Now checking for 1000 (100%)
+            self.timer.stop()
+            self.progress_bar.setValue(100)  # Set to 100% once done
+        else:
+            
+            self.progress_bar.setValue(self.progress_bar.value() + 1)
+
+
+
+    def update_data_graph(self, output):
+        x_data, data0, data1 = self.parse_output_to_list(output)
+        
+        self.data_canvas.axes.clear()
+        self.data_canvas.axes.plot(x_data, data0, label="Channel 1", color='blue')
+        self.data_canvas.axes.plot(x_data, data1, label="Channel 2", color='red')
+        self.data_canvas.axes.set_title("Sampled data")
+        self.data_canvas.axes.set_xlabel("Samples")
+        self.data_canvas.axes.set_ylabel("Amplitude (V/I)")
+        self.data_canvas.draw()
+
+
+    def plot_fft(self, output):
+        x_data, data0, data1 = self.parse_output_to_list(output)
+        
+        # Create FFT worker threads for both data1 (Channel 1) and data0 (Channel 2)
+        self.fft_worker1 = FFTWorker(data0, self.sampling_frequency)
+        self.fft_worker2 = FFTWorker(data1, self.sampling_frequency)
+        
+        # Plot FFT for Channel 1 (Blue) and Channel 2 (Red)
+        self.fft_worker1.result.connect(lambda freq, fft_result: self.on_fft_complete(freq, fft_result, 1))
+        self.fft_worker1.result.connect(lambda freq, fft_result: self.handle_fft_result(freq, fft_result, 1))
+        
+        self.fft_worker2.result.connect(lambda freq, fft_result: self.on_fft_complete(freq, fft_result, 2))
+        self.fft_worker2.result.connect(lambda freq, fft_result: self.handle_fft_result(freq, fft_result, 2))
+        
+        # Start both FFT workers
+        self.fft_worker1.start()
+        self.fft_worker2.start()
+
+    def on_fft_complete(self, freq, fft_result, channel):
+        # Clear the axes once, before plotting for both channels
+        fft_result=np.abs(fft_result)
+        if channel == 1:
+            self.fft_canvas.axes.clear()
+        
+        color = 'blue' if channel == 1 else 'red'
+    
+        # Plot the FFT result for each channel on the same canvas
+        self.fft_canvas.axes.plot(freq[:len(freq)//2], fft_result[:len(freq)//2], label=f"Channel {channel}", color=color)
+    
+    
+        if channel == 1:
+            self.fft_canvas.axes.set_title("FFT - Channel 1 (Blue) and Channel 2 (Red)")
+            self.fft_canvas.axes.set_xlabel("Frequency (Hz)")
+            self.fft_canvas.axes.set_ylabel("Magnitude")
+    
+        if channel == 2:
+            self.fft_canvas.axes.legend()  # Add the legend after both channels are plotted
+            self.fft_canvas.draw()
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = FPGAApp()
+    window.show()
+    sys.exit(app.exec_())
